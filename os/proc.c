@@ -89,6 +89,17 @@ found:
 	memset((void *)p->trapframe, 0, TRAP_PAGE_SIZE);
 	p->context.ra = (uint64)usertrapret;
 	p->context.sp = p->kstack + KSTACK_SIZE;
+	//Initialize all the new stride scheduling fields
+
+	//stride starts at 0 so that all processes begin equal in the scheduler
+	p->stride = 0;
+
+	//Priority defaults to 16, the higher the value the more CPU time under the stride scheduling
+	p->priority = 16;
+
+	//One pass is big_stride over priority, the higher priority processes gets a smaller pass value
+	// which means its tride increases slower and gets selected more often
+	p->pass = BIG_STRIDE / p->priority;
 	return p;
 }
 
@@ -100,28 +111,29 @@ found:
 void scheduler()
 {
 	struct proc *p;
+	//Create a chosen variable for the current process
+	struct proc *chosen;
+	// wrap the scheduler in an infinite loop so that it never returns
 	for (;;) {
-		/*int has_proc = 0;
+		// Find the RUNNABLE process with the minimum stride
+		chosen = NULL;
 		for (p = pool; p < &pool[NPROC]; p++) {
 			if (p->state == RUNNABLE) {
-				has_proc = 1;
-				tracef("swtich to proc %d", p - pool);
-				p->state = RUNNING;
-				current_proc = p;
-				swtch(&idle.context, &p->context);
+				if (chosen == NULL || p->stride < chosen->stride) {
+					chosen = p;
+				}
 			}
 		}
-		if(has_proc == 0) {
-			panic("all app are over!\n");
-		}*/
-		p = fetch_task();
-		if (p == NULL) {
+		if (chosen == NULL) {
 			panic("all app are over!\n");
 		}
-		tracef("swtich to proc %d", p - pool);
-		p->state = RUNNING;
-		current_proc = p;
-		swtch(&idle.context, &p->context);
+		// Advance the chosen process's stride by its pass value
+		chosen->stride += chosen->pass;
+
+		// Switch to the chosen process
+		chosen->state = RUNNING;
+		current_proc = chosen;
+		swtch(&idle.context, &chosen->context);
 	}
 }
 
@@ -144,7 +156,7 @@ void sched()
 void yield()
 {
 	current_proc->state = RUNNABLE;
-	add_task(current_proc);
+	// add_task(current_proc);
 	sched();
 }
 
@@ -184,7 +196,7 @@ int fork()
 	np->trapframe->a0 = 0;
 	np->parent = p;
 	np->state = RUNNABLE;
-	add_task(np);
+	// add_task(np);
 	return np->pid;
 }
 
@@ -226,7 +238,7 @@ int wait(int pid, int *code)
 			return -1;
 		}
 		p->state = RUNNABLE;
-		add_task(p);
+		// add_task(p);
 		sched();
 	}
 }
