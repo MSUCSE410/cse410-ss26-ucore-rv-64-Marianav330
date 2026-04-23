@@ -3,6 +3,7 @@
 #include "fcntl.h"
 #include "fs.h"
 #include "proc.h"
+#include "stat.h"
 
 //This is a system-level open file table that holds open files of all process.
 struct file filepool[FILEPOOLSIZE];
@@ -153,4 +154,36 @@ uint64 inoderead(struct file *f, uint64 va, uint64 len)
 	if ((r = readi(f->ip, 1, va, f->off, len)) > 0)
 		f->off += r;
 	return r;
+}
+
+// Fills a kernel Stat struct with metadata about the open file `f` and copies
+// it out to the user-space address `addr`.
+// Returns 0 on success, -1 if `f` is not an inode-backed file or if copyout fails.
+int filestat(struct file *f, uint64 addr)
+{
+    struct proc *p = curr_proc();  // Get the currently running process (needed
+                                   //   for its page table during copyout)
+    struct Stat st;
+
+    // Only inode-backed files have meaningful stat data;
+    // sockets, pipes, devices, etc. are rejected here.
+    if (f->type != FD_INODE)
+        return -1;
+
+    ivalid(f->ip);          // Ensure the in-memory inode is populated from disk
+                            //   before we read any of its fields
+    memset(&st, 0, sizeof(st)); // Zero the stat struct so no garbage leaks
+                                //   to user space in unused fields
+
+    st.dev   = 0;                    // Single-disk system; device number is always 0
+    st.ino   = f->ip->inum;          // Inode number uniquely identifies the file
+    // Translate the internal type flag into the user-visible mode constant
+    st.mode  = (f->ip->type == T_DIR) ? STAT_DIR : STAT_FILE;
+    st.nlink = (uint32)f->ip->nlink; // Hard-link count visible to userspace
+
+    // Copy the completed stat struct from kernel space into the user's address
+    // space at the pointer they provided; fail if the address is invalid.
+    if (copyout(p->pagetable, addr, (char *)&st, sizeof(st)) < 0)
+        return -1;
+    return 0;
 }

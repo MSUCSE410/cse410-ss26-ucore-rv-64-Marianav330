@@ -100,46 +100,62 @@ struct {
 static struct inode *iget(uint dev, uint inum);
 
 // Allocate an inode on device dev.
-// Mark it as allocated by  giving it type `type`.
+// Mark it as allocated by giving it type `type`.
 // Returns an allocated and referenced inode.
+// Scans the inode table on disk looking for a free slot (type == 0),
+// initialises it, writes it back, then returns a referenced in-memory handle.
 struct inode *ialloc(uint dev, short type)
 {
-	int inum;
-	struct buf *bp;
-	struct dinode *dip;
+    int inum;
+    struct buf *bp;
+    struct dinode *dip;
 
-	for (inum = 1; inum < sb.ninodes; inum++) {
-		bp = bread(dev, IBLOCK(inum, sb));
-		dip = (struct dinode *)bp->data + inum % IPB;
-		if (dip->type == 0) { // a free inode
-			memset(dip, 0, sizeof(*dip));
-			dip->type = type;
-			bwrite(bp);
-			brelse(bp);
-			return iget(dev, inum);
-		}
-		brelse(bp);
-	}
-	panic("ialloc: no inodes");
-	return 0;
+// Walk every possible inode number (starting at 1; 0 is reserved)
+    for (inum = 1; inum < sb.ninodes; inum++) {
+		// Read the disk block that contains inode `inum`.
+        // IBLOCK() maps an inode number to its containing block number.
+        bp = bread(dev, IBLOCK(inum, sb));
+
+		// Compute a pointer to the specific dinode within the block.
+        // IPB = inodes per block; the modulo gives the index within that block.
+        dip = (struct dinode *)bp->data + inum % IPB;
+        if (dip->type == 0) {           // type == 0 means the slot is free
+            memset(dip, 0, sizeof(*dip)); // Clear all fields before initialising
+            dip->type  = type;            // Mark the inode as in-use with the
+                                          //   requested file type
+            dip->nlink = 1;   // LAB4: new inode starts with 1 hard link
+                              //   (the directory entry that will reference it)
+            bwrite(bp);       // Persist the initialised dinode to disk
+            brelse(bp);       // Release the buffer cache entry
+            return iget(dev, inum); // Return a referenced in-memory inode handle
+        }
+        brelse(bp); // This slot was taken; release the buffer and keep scanning
+    }
+    panic("ialloc: no inodes"); // Disk inode table is completely full
+    return 0;
 }
 
 // Copy a modified in-memory inode to disk.
-// Must be called after every change to an ip->xxx field
-// that lives on disk.
+// Must be called after every change to an ip->xxx field that lives on disk,
+// so the persistent image stays consistent with the in-memory cache.
 void iupdate(struct inode *ip)
 {
-	struct buf *bp;
-	struct dinode *dip;
+    struct buf *bp;
+    struct dinode *dip;
 
-	bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-	dip = (struct dinode *)bp->data + ip->inum % IPB;
-	dip->type = ip->type;
-	dip->size = ip->size;
-	// LAB4: you may need to update link count here
-	memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
-	bwrite(bp);
-	brelse(bp);
+	// Read the block containing this inode so the rest of the block is
+    // preserved when we write back only the changed dinode.
+    bp  = bread(ip->dev, IBLOCK(ip->inum, sb));
+    dip = (struct dinode *)bp->data + ip->inum % IPB; // Pointer to this inode  within the block
+
+	// Flush every on-disk field from the in-memory inode to the dinode
+    dip->type  = ip->type;
+    dip->nlink = ip->nlink;   // LAB4: keep link count in sync
+    dip->size  = ip->size;
+    memmove(dip->addrs, ip->addrs, sizeof(ip->addrs)); // Copy all block pointers
+
+    bwrite(bp); // Write the updated block back to disk
+    brelse(bp); // Release the buffer cache entry
 }
 
 // Find the inode with number inum on device dev
@@ -182,20 +198,20 @@ struct inode *idup(struct inode *ip)
 // Reads the inode from disk if necessary.
 void ivalid(struct inode *ip)
 {
-	struct buf *bp;
-	struct dinode *dip;
-	if (ip->valid == 0) {
-		bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-		dip = (struct dinode *)bp->data + ip->inum % IPB;
-		ip->type = dip->type;
-		ip->size = dip->size;
-		// LAB4: You may need to get lint count here
-		memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
-		brelse(bp);
-		ip->valid = 1;
-		if (ip->type == 0)
-			panic("ivalid: no type");
-	}
+    struct buf *bp;
+    struct dinode *dip;
+    if (ip->valid == 0) {
+        bp  = bread(ip->dev, IBLOCK(ip->inum, sb));
+        dip = (struct dinode *)bp->data + ip->inum % IPB;
+        ip->type  = dip->type;
+        ip->nlink = dip->nlink;   // LAB4: load link count
+        ip->size  = dip->size;
+        memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
+        brelse(bp);
+        ip->valid = 1;
+        if (ip->type == 0)
+            panic("ivalid: no type");
+    }
 }
 
 // Drop a reference to an in-memory inode.
@@ -207,15 +223,14 @@ void ivalid(struct inode *ip)
 // case it has to free the inode.
 void iput(struct inode *ip)
 {
-	// LAB4: Unmark the condition and change link count variable name (nlink) if needed
-	if (ip->ref == 1 && ip->valid && 0 /*&& ip->nlink == 0*/) {
-		// inode has no links and no other references: truncate and free.
-		itrunc(ip);
-		ip->type = 0;
-		iupdate(ip);
-		ip->valid = 0;
-	}
-	ip->ref--;
+    // LAB4: free the inode when the last hard link AND last ref are gone
+    if (ip->ref == 1 && ip->valid && ip->nlink == 0) {
+        itrunc(ip);
+        ip->type = 0;
+        iupdate(ip);
+        ip->valid = 0;
+    }
+    ip->ref--;
 }
 
 // Inode content
@@ -429,6 +444,33 @@ int dirlink(struct inode *dp, char *name, uint inum)
 }
 
 // LAB4: You may want to add dirunlink here
+// Zeroes out the entry on disk (freeing the slot for future dirlink calls)
+// and drops the inode reference acquired by dirlookup.
+// Returns 0 on success, -1 if the name is not found in the directory.
+int dirunlink(struct inode *dp, char *name)
+{
+    uint off;// Byte offset of the located entry within the directory
+    struct dirent de;  // Temporary dirent used to write zeros back to disk
+    struct inode *ip;
+
+	// Search the directory for `name`; on success `off` holds the entry's
+    // byte offset and `ip` is a referenced in-memory inode for the target file.
+    ip = dirlookup(dp, name, &off);
+    if (ip == 0)
+        return -1; // Entry not found; nothing to unlink
+
+    // Zero-out the directory entry so the slot is free.
+    memset(&de, 0, sizeof(de));
+    if (writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+        panic("dirunlink: writei"); // Partial write would corrupt the directory
+
+
+	// Drop the reference obtained by dirlookup.
+    // If this was the last hard link AND the last reference, iput will
+    // also free the inode and its data blocks via the nlink == 0 path.
+    iput(ip);
+    return 0;
+}
 
 //Return the inode of the root directory
 struct inode *root_dir()
